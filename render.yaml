@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: schemaflow
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: SHOPIFY_API_VERSION
+        value: "2026-04"
+      # Set this in the Render dashboard (do NOT commit a real token).
+      - key: SHOPIFY_ADMIN_TOKEN
+        sync: false
