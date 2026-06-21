@@ -36,8 +36,28 @@ const THEME_FILES_MUTATION = `mutation SchemaFlowThemeFiles($themeId: ID!, $file
   }
 }`;
 
+const THEME_FILES_EXIST_QUERY = `query SchemaFlowThemeFilesExist($id: ID!, $names: [String!]) {
+  theme(id: $id) { files(filenames: $names, first: 50) { nodes { filename } } }
+}`;
+
 const normalizeStore = (raw = "") =>
   String(raw).trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "").replace(/\s+/g, "");
+
+// A minimal but valid section file so a template referencing it can validate.
+const stubSection = (type) => {
+  const title = type.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()).slice(0, 24) || "Section";
+  return `{%- comment -%} sections/${type}.liquid — auto-created by SchemaFlow {%- endcomment -%}
+<div class="${type}" {{ section.shopify_attributes }}></div>
+
+{% schema %}
+{
+  "name": ${JSON.stringify(title)},
+  "settings": [],
+  "presets": [{ "name": ${JSON.stringify(title)} }]
+}
+{% endschema %}
+`;
+};
 
 // One place to POST GraphQL and normalize HTTP / GraphQL-level errors.
 async function shopifyGraphQL(endpoint, token, query, variables) {
@@ -113,9 +133,40 @@ app.post("/api/deploy", async (req, res) => {
         return res.status(404).json({ ok: false, error: "No theme found on this store to write into.", results });
       }
 
+      // Collect every section type referenced by the template files in this batch.
+      const referenced = new Set();
+      for (const f of files) {
+        if (/^templates\/.+\.json$/.test(f.filename)) {
+          try {
+            const tpl = JSON.parse(String(f.value || "{}"));
+            Object.values(tpl.sections || {}).forEach((s) => { if (s && s.type) referenced.add(s.type); });
+          } catch { /* ignore unparseable template */ }
+        }
+      }
+
+      // Section files we're already deploying don't need a stub.
+      const deploying = new Set(files.filter((f) => f.filename.startsWith("sections/")).map((f) => f.filename));
+      const candidates = [...referenced]
+        .map((t) => `sections/${t}.liquid`)
+        .filter((fn) => !deploying.has(fn));
+
+      // Of the remaining, only stub the ones that DON'T already exist in the theme
+      // (so we never overwrite the theme's built-in sections like main-product).
+      let stubFiles = [];
+      if (candidates.length) {
+        const existData = await shopifyGraphQL(endpoint, token, THEME_FILES_EXIST_QUERY, {
+          id: main.id, names: candidates.slice(0, 50),
+        });
+        const existing = new Set((existData?.theme?.files?.nodes || []).map((n) => n.filename));
+        stubFiles = candidates
+          .filter((fn) => !existing.has(fn))
+          .map((fn) => ({ filename: fn, value: stubSection(fn.slice("sections/".length, -".liquid".length)), _stub: true }));
+      }
+
+      const allFiles = [...files, ...stubFiles];
       const data = await shopifyGraphQL(endpoint, token, THEME_FILES_MUTATION, {
         themeId: main.id,
-        files: files.map((f) => ({ filename: f.filename, body: { type: "TEXT", value: String(f.value ?? "") } })),
+        files: allFiles.map((f) => ({ filename: f.filename, body: { type: "TEXT", value: String(f.value ?? "") } })),
       });
       const payload = data?.themeFilesUpsert;
       const userErrors = payload?.userErrors || [];
@@ -126,8 +177,9 @@ app.post("/api/deploy", async (req, res) => {
           results,
         });
       }
+      const stubSet = new Set(stubFiles.map((f) => f.filename));
       for (const f of payload?.upsertedThemeFiles || []) {
-        results.push({ kind: "theme", name: f.filename, id: `${main.name} (theme)` });
+        results.push({ kind: "theme", name: stubSet.has(f.filename) ? `${f.filename} (auto-created)` : f.filename, id: `${main.name} (theme)` });
       }
     }
 

@@ -298,8 +298,9 @@ function highlightLiquid(code) {
 
 function settingJson(s) {
   const o = { type: SECTION_TYPES[s.type]?.shopify || "text", id: handleOf(s.name), label: s.name };
-  if (s.type === "S_CHECKBOX") o.default = true;
-  else if (s.type === "S_TEXT" || s.type === "S_RICHTEXT") o.default = "";
+  // Only emit a default when it is valid & non-blank. Shopify rejects blank
+  // defaults for text/richtext/url/etc., so those are omitted entirely.
+  if (s.type === "S_CHECKBOX") o.default = false;
   else if (s.type === "S_COLOR") o.default = "#000000";
   return o;
 }
