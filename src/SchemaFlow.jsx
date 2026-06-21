@@ -66,6 +66,18 @@ const handleOf = (s) =>
 const dashOf = (s) => handleOf(s).replace(/_/g, "-");
 
 const field = (name, type, extra = {}) => ({ id: uid("f"), name, type, required: false, ...extra });
+
+// cascade new nodes so they never spawn exactly on top of each other
+const spawnPos = (k) => ({ x: 96 + (k % 7) * 40, y: 92 + (k % 7) * 34 });
+// keep names (and therefore handles) unique within a family
+const uniqueName = (base, list, category) => {
+  const taken = new Set(list.filter((n) => !category || n.category === category).map((n) => n.name));
+  if (!taken.has(base)) return base;
+  let i = 2;
+  while (taken.has(`${base} ${i}`)) i++;
+  return `${base} ${i}`;
+};
+
 const nodeHeight = (n) => {
   const rows = Math.max((n.fields ? n.fields.length : 0) + (n.category === "section" && n.blocks?.length ? 1 : 0), 1);
   const extra = n.category === "template" ? 18 : 0; // template kind badge row
@@ -606,22 +618,49 @@ export default function SchemaFlow() {
 
   /* mutations */
   const addObject = (category = "metaobject") => {
-    const base = { id: uid(), x: 120 + Math.random() * 60, y: 110 + Math.random() * 70 };
+    const base = { id: uid(), ...spawnPos(nodes.length) };
     let n;
     if (category === "section") {
-      n = { ...base, category, name: "Hero section", tag: "section", cssClass: "hero-section",
+      const name = uniqueName("Hero section", nodes, "section");
+      n = { ...base, category, name, tag: "section", cssClass: dashOf(name),
         blocks: [],
         fields: [field("Heading", "S_TEXT"), field("Background", "S_IMAGE"), field("Show button", "S_CHECKBOX")] };
     } else if (category === "template") {
       const kind = "product";
-      n = { ...base, category, name: "Product page", templateType: kind,
+      n = { ...base, category, name: uniqueName("Product page", nodes, "template"), templateType: kind,
         fields: TEMPLATE_KINDS[kind].seed.map((t) => field(t, "SECTION")) };
     } else {
-      n = { ...base, category, name: category === "metafield" ? "Custom owner" : "Custom object", fields: [] };
+      const fallback = category === "metafield" ? "Custom owner" : "Custom object";
+      n = { ...base, category, name: uniqueName(fallback, nodes, category), fields: [] };
     }
-    setNodes((p) => [...p, n]);
+
+    // auto-map: if a new section is added and exactly one page template exists,
+    // append it to that template so the connecting arrow appears immediately.
+    const templates = nodes.filter((p) => p.category === "template");
+    setNodes((prev) => {
+      let next = [...prev, n];
+      if (category === "section" && templates.length === 1) {
+        next = next.map((p) =>
+          p.id === templates[0].id
+            ? { ...p, fields: [...p.fields, field(n.name, "SECTION", { targetNodeId: n.id })] }
+            : p);
+      }
+      return next;
+    });
     setSelectedId(n.id);
   };
+
+  // one-click: pull every section node on the canvas into the selected template
+  const mapAllSections = () => {
+    if (!selected || selected.category !== "template") return;
+    const present = new Set(selected.fields.map((f) => f.targetNodeId).filter(Boolean));
+    const toAdd = nodes
+      .filter((nd) => nd.category === "section" && !present.has(nd.id))
+      .map((s) => field(s.name, "SECTION", { targetNodeId: s.id }));
+    if (toAdd.length) patchSelected({ fields: [...selected.fields, ...toAdd] });
+    else fireToast("All canvas sections are already mapped");
+  };
+
   const patchSelected = (patch) => setNodes((p) => p.map((n) => (n.id === selectedId ? { ...n, ...patch } : n)));
   const removeNode = (id) => {
     setNodes((p) => p.filter((n) => n.id !== id).map((n) => ({ ...n, fields: n.fields.filter((f) => f.targetNodeId !== id) })));
@@ -989,13 +1028,22 @@ export default function SchemaFlow() {
                       </select>
                     </div>
 
-                    <div className="font-mono text-[9px] uppercase tracking-wider text-slate-500">Section order — drag handles on the canvas</div>
+                    <div className="flex items-center justify-between">
+                      <div className="font-mono text-[9px] uppercase tracking-wider text-slate-500">Section order — drag handles on the canvas</div>
+                      {nodes.some((n) => n.category === "section") && (
+                        <button onClick={mapAllSections}
+                          className="flex items-center gap-1 rounded-md border border-sky-500/40 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-300 transition-colors hover:bg-sky-500/20">
+                          <Workflow size={11} /> Map all sections
+                        </button>
+                      )}
+                    </div>
                     <div className="space-y-1.5">
                       {selected.fields.map((f, i) => (
                         <div key={f.id} className="group flex items-center gap-2 rounded-md border border-sky-500/20 bg-sky-500/5 px-2 py-1.5">
                           <span className="font-mono text-[10px] font-bold text-sky-400">{String(i + 1).padStart(2, "0")}</span>
                           <SquareStack size={12} className="text-sky-300" />
                           <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-200">{f.targetNodeId ? dashOf(f.name) : f.name}</span>
+                          {f.targetNodeId && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="linked to a section node" />}
                           <button onClick={() => moveField(selected.id, f.id, -1)} disabled={i === 0}
                             className="text-slate-500 hover:text-sky-300 disabled:opacity-20"><ChevronUp size={13} /></button>
                           <button onClick={() => moveField(selected.id, f.id, 1)} disabled={i === selected.fields.length - 1}
