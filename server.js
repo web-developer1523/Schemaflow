@@ -18,71 +18,75 @@ const PORT = process.env.PORT || 3000;                 // Render injects PORT
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-04";
 
 app.use(cors());                                       // same-origin in prod; handy in dev
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const MUTATION = `mutation SchemaFlowCreate($definition: MetaobjectDefinitionCreateInput!) {
+const META_MUTATION = `mutation SchemaFlowCreate($definition: MetaobjectDefinitionCreateInput!) {
   metaobjectDefinitionCreate(definition: $definition) {
     metaobjectDefinition { id type name }
     userErrors { field message code }
   }
 }`;
 
+const THEMES_QUERY = `query SchemaFlowThemes { themes(first: 50) { nodes { id name role } } }`;
+
+const THEME_FILES_MUTATION = `mutation SchemaFlowThemeFiles($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
+  themeFilesUpsert(themeId: $themeId, files: $files) {
+    upsertedThemeFiles { filename }
+    userErrors { field message }
+  }
+}`;
+
 const normalizeStore = (raw = "") =>
   String(raw).trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "").replace(/\s+/g, "");
+
+// One place to POST GraphQL and normalize HTTP / GraphQL-level errors.
+async function shopifyGraphQL(endpoint, token, query, variables) {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const err = new Error(`Shopify HTTP ${res.status} ${res.statusText}${text ? ` — ${text.slice(0, 400)}` : ""}`);
+    err.status = res.status === 401 || res.status === 403 ? res.status : 502;
+    throw err;
+  }
+  const data = await res.json();
+  if (Array.isArray(data.errors) && data.errors.length) {
+    const err = new Error(data.errors.map((e) => e.message).join(" · "));
+    err.status = 502;
+    throw err;
+  }
+  return data.data;
+}
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, apiVersion: API_VERSION }));
 
 app.post("/api/deploy", async (req, res) => {
   try {
-    const { storeUrl, adminApiToken, jsonSchema } = req.body || {};
+    const { storeUrl, adminApiToken, jsonSchema, themeFiles } = req.body || {};
 
     // Token may come from the request OR a server-side env var (keeps it out of the browser).
     const token = (adminApiToken && String(adminApiToken).trim()) || process.env.SHOPIFY_ADMIN_TOKEN;
     const host = normalizeStore(storeUrl);
 
+    const defs = Array.isArray(jsonSchema) ? jsonSchema : [];
+    const files = Array.isArray(themeFiles) ? themeFiles : [];
+
     if (!host) return res.status(400).json({ ok: false, error: "Missing storeUrl (your-store.myshopify.com)." });
     if (!token) return res.status(400).json({ ok: false, error: "Missing Admin API access token." });
-    if (!Array.isArray(jsonSchema) || jsonSchema.length === 0)
-      return res.status(400).json({ ok: false, error: "jsonSchema must be a non-empty array of metaobject definitions." });
+    if (defs.length === 0 && files.length === 0)
+      return res.status(400).json({ ok: false, error: "Nothing to deploy — send at least one metaobject definition or theme file." });
 
     const endpoint = `https://${host}/admin/api/${API_VERSION}/graphql.json`;
     const results = [];
 
-    for (const definition of jsonSchema) {
-      const shopifyRes = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": token,
-        },
-        body: JSON.stringify({ query: MUTATION, variables: { definition } }),
-      });
-
-      // Surface non-2xx (bad token => 401, wrong domain => 404, throttling => 429, etc.)
-      if (!shopifyRes.ok) {
-        const text = await shopifyRes.text().catch(() => "");
-        return res.status(502).json({
-          ok: false,
-          error: `Shopify HTTP ${shopifyRes.status} ${shopifyRes.statusText}${text ? ` — ${text.slice(0, 400)}` : ""}`,
-          results,
-        });
-      }
-
-      const data = await shopifyRes.json();
-
-      // Top-level GraphQL errors (e.g. invalid query, access scope missing)
-      if (Array.isArray(data.errors) && data.errors.length) {
-        return res.status(502).json({
-          ok: false,
-          error: data.errors.map((e) => e.message).join(" · "),
-          results,
-        });
-      }
-
-      const payload = data.data?.metaobjectDefinitionCreate;
+    // ---- 1) Metaobject definitions (Admin GraphQL) ----
+    for (const definition of defs) {
+      const data = await shopifyGraphQL(endpoint, token, META_MUTATION, { definition });
+      const payload = data?.metaobjectDefinitionCreate;
       const userErrors = payload?.userErrors || [];
-
-      // Validation errors (e.g. duplicate type, reference needs a definition GID)
       if (userErrors.length) {
         return res.status(422).json({
           ok: false,
@@ -92,18 +96,44 @@ app.post("/api/deploy", async (req, res) => {
           results,
         });
       }
-
       results.push({
+        kind: "metaobject",
         name: payload?.metaobjectDefinition?.name || definition.name,
-        type: payload?.metaobjectDefinition?.type || definition.type,
         id: payload?.metaobjectDefinition?.id || "created",
       });
     }
 
+    // ---- 2) Theme files: sections + templates (themeFilesUpsert) ----
+    if (files.length) {
+      // Resolve the published (MAIN) theme to write into.
+      const themesData = await shopifyGraphQL(endpoint, token, THEMES_QUERY, {});
+      const nodes = themesData?.themes?.nodes || [];
+      const main = nodes.find((t) => t.role === "MAIN") || nodes[0];
+      if (!main) {
+        return res.status(404).json({ ok: false, error: "No theme found on this store to write into.", results });
+      }
+
+      const data = await shopifyGraphQL(endpoint, token, THEME_FILES_MUTATION, {
+        themeId: main.id,
+        files: files.map((f) => ({ filename: f.filename, body: { type: "TEXT", value: String(f.value ?? "") } })),
+      });
+      const payload = data?.themeFilesUpsert;
+      const userErrors = payload?.userErrors || [];
+      if (userErrors.length) {
+        return res.status(422).json({
+          ok: false,
+          error: `Theme files (${main.name}): ${userErrors.map((e) => `${e.message}${e.field ? ` (${e.field})` : ""}`).join(" · ")}`,
+          results,
+        });
+      }
+      for (const f of payload?.upsertedThemeFiles || []) {
+        results.push({ kind: "theme", name: f.filename, id: `${main.name} (theme)` });
+      }
+    }
+
     return res.json({ ok: true, store: host, apiVersion: API_VERSION, results });
   } catch (err) {
-    // Network/DNS failures from the server to Shopify land here.
-    return res.status(500).json({ ok: false, error: err?.message || "Unexpected server error." });
+    return res.status(err?.status || 500).json({ ok: false, error: err?.message || "Unexpected server error." });
   }
 });
 

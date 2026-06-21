@@ -808,13 +808,28 @@ export default function SchemaFlow() {
     raw.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "").replace(/\s+/g, "");
 
   const openDeploy = () => {
-    if (schema.metaobjectDefinitions.length === 0) {
-      fireToast("Add at least one metaobject before deploying", false);
+    const deployables = schema.metaobjectDefinitions.length
+      + nodes.filter((n) => n.category === "section").length
+      + nodes.filter((n) => n.category === "template").length;
+    if (deployables === 0) {
+      fireToast("Add a metaobject, section, or template before deploying", false);
       return;
     }
     setDeployState({ phase: "idle", step: "", log: [], error: "" });
     setModalOpen(true);
   };
+
+  // sections + templates become real theme files (themeFilesUpsert handles these)
+  const buildThemeFiles = useCallback(() => {
+    const out = [];
+    nodes.filter((n) => n.category === "section").forEach((n) => {
+      out.push({ filename: `sections/${dashOf(n.name)}.liquid`, value: buildSectionLiquid(n) });
+    });
+    nodes.filter((n) => n.category === "template").forEach((n) => {
+      out.push({ filename: `templates/${TEMPLATE_KINDS[n.templateType]?.file || "template.json"}`, value: buildTemplateText(n, nodes) });
+    });
+    return out;
+  }, [nodes]);
 
   const runLiveDeploy = async () => {
     const host = normalizeStore(storeUrl);
@@ -822,14 +837,15 @@ export default function SchemaFlow() {
     if (!token.trim()) { setDeployState((s) => ({ ...s, phase: "error", error: "Enter your Admin API access token (shpat_…)." })); return; }
 
     const jsonSchema = toShopifyDefinitions();
-    setDeployState({ phase: "running", step: `Deploying ${jsonSchema.length} definition${jsonSchema.length === 1 ? "" : "s"} via backend…`, log: [], error: "" });
+    const themeFiles = buildThemeFiles();
+    const total = jsonSchema.length + themeFiles.length;
+    setDeployState({ phase: "running", step: `Deploying ${jsonSchema.length} definition${jsonSchema.length === 1 ? "" : "s"} + ${themeFiles.length} theme file${themeFiles.length === 1 ? "" : "s"} via backend…`, log: [], error: "" });
 
     try {
-      // Standard same-origin call to OUR server — no CORS, token relayed server-to-server.
       const res = await fetch(DEPLOY_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ storeUrl: host, adminApiToken: token.trim(), jsonSchema }),
+        body: JSON.stringify({ storeUrl: host, adminApiToken: token.trim(), jsonSchema, themeFiles }),
       });
 
       let data = {};
@@ -842,7 +858,7 @@ export default function SchemaFlow() {
       const log = (data.results || []).map((r) => `✓ ${r.name} → ${r.id}`);
       setDeployState({ phase: "done", step: "", log, error: "" });
       setModalOpen(false);
-      fireToast(`Successfully deployed to ${host}! Your Metaobjects are now live in your Shopify Admin panel.`);
+      fireToast(`Successfully deployed to ${host}! ${total} item${total === 1 ? "" : "s"} are now live in your Shopify Admin.`);
     } catch (err) {
       setDeployState((s) => ({ ...s, phase: "error", error: err?.message || String(err) }));
     }
@@ -1154,19 +1170,12 @@ export default function SchemaFlow() {
             className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-1.5 text-[12px] font-semibold text-slate-200 transition-colors hover:bg-slate-800">
             <Copy size={13} /> Copy
           </button>
-          {ctx === "data" ? (
-            <button onClick={openDeploy}
-              className="ml-auto flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-all"
-              style={{ background: "linear-gradient(135deg,#34d399,#10b981)",
-                boxShadow: "0 8px 18px -8px rgba(52,211,153,0.7)", color: "#06281c" }}>
-              <Rocket size={13} /> Deploy to Shopify Store
-            </button>
-          ) : (
-            <span className="ml-auto flex items-center gap-1.5 font-mono text-[10px] text-slate-500">
-              {ctx === "theme" ? <Puzzle size={11} className="text-amber-400" /> : <LayoutTemplate size={11} className="text-sky-400" />}
-              {ctx === "theme" ? "theme file — commit to repo" : "layout file — commit to /templates"}
-            </span>
-          )}
+          <button onClick={openDeploy}
+            className="ml-auto flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-all"
+            style={{ background: "linear-gradient(135deg,#34d399,#10b981)",
+              boxShadow: "0 8px 18px -8px rgba(52,211,153,0.7)", color: "#06281c" }}>
+            <Rocket size={13} /> Deploy to Shopify Store
+          </button>
         </div>
 
         {/* migration toggle (data context only) */}
@@ -1240,7 +1249,11 @@ export default function SchemaFlow() {
           token={token} setToken={setToken}
           showToken={showToken} setShowToken={setShowToken}
           apiVersion={API_VERSION}
-          defCount={schema.metaobjectDefinitions.length}
+          counts={{
+            defs: schema.metaobjectDefinitions.length,
+            sections: nodes.filter((n) => n.category === "section").length,
+            templates: nodes.filter((n) => n.category === "template").length,
+          }}
           state={deployState}
           onClose={() => { if (deployState.phase !== "running") setModalOpen(false); }}
           onDeploy={runLiveDeploy}
@@ -1327,9 +1340,15 @@ function MigMetric({ icon: Icon, value, label }) {
 }
 
 function DeployModal({ host, storeUrl, setStoreUrl, token, setToken, showToken, setShowToken,
-  apiVersion, defCount, state, onClose, onDeploy }) {
+  apiVersion, counts, state, onClose, onDeploy }) {
   const running = state.phase === "running";
   const tokenLooksOff = token.trim() && !token.trim().startsWith("shpat_");
+  const themeCount = (counts?.sections || 0) + (counts?.templates || 0);
+  const summary = [
+    counts?.defs ? `${counts.defs} metaobject${counts.defs === 1 ? "" : "s"}` : null,
+    counts?.sections ? `${counts.sections} section${counts.sections === 1 ? "" : "s"}` : null,
+    counts?.templates ? `${counts.templates} template${counts.templates === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(" · ") || "nothing selected";
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-4"
@@ -1347,7 +1366,7 @@ function DeployModal({ host, storeUrl, setStoreUrl, token, setToken, showToken, 
           </span>
           <div className="leading-tight">
             <div className="text-[14px] font-bold text-white">Deploy live to Shopify</div>
-            <div className="font-mono text-[10px] text-slate-500">Admin GraphQL · {apiVersion} · {defCount} definition{defCount === 1 ? "" : "s"}</div>
+            <div className="font-mono text-[10px] text-slate-500">Admin API {apiVersion} · {summary}</div>
           </div>
           <button onClick={onClose} disabled={running}
             className="ml-auto grid h-7 w-7 place-items-center rounded-md text-slate-500 transition-colors hover:bg-slate-800 hover:text-slate-200 disabled:opacity-40">
@@ -1393,6 +1412,18 @@ function DeployModal({ host, storeUrl, setStoreUrl, token, setToken, showToken, 
               and never written to disk or logged. Nothing is stored after the request completes.
             </p>
           </div>
+
+          {/* theme-file note */}
+          {themeCount > 0 && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2.5">
+              <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-400" />
+              <p className="text-[11px] leading-relaxed text-amber-200/90">
+                {themeCount} theme file{themeCount === 1 ? "" : "s"} will be written to your <strong>published theme</strong> via
+                {" "}<span className="font-mono">themeFilesUpsert</span>. This needs the <span className="font-mono">write_themes</span> scope
+                and a Shopify theme-files exemption — without it Shopify returns an access error (shown below if so).
+              </p>
+            </div>
+          )}
 
           {/* running log */}
           {running && (

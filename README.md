@@ -29,9 +29,17 @@ npm run dev               # runs Vite + Express together
 
 ## Shopify setup
 In your store: Settings → Apps and sales channels → Develop apps → create an app →
-Admin API access scopes: enable `write_metaobject_definitions` (and
-`read_metaobject_definitions`). Install it, then copy the `shpat_…` Admin API token
-into the deploy modal (or the env var).
+Admin API access scopes. Enable:
+- `write_metaobject_definitions` + `read_metaobject_definitions` — for metaobjects.
+- `write_themes` — for deploying sections & page templates (theme files).
 
-> Note: references between metaobjects validate against a definition **GID**, so
-> create the base definitions first, then the ones that point at them.
+Install the app, then copy the `shpat_…` Admin API token into the deploy modal
+(or set it as the `SHOPIFY_ADMIN_TOKEN` env var).
+
+> Theme files (sections / templates) are written to your **published theme** via the
+> `themeFilesUpsert` mutation, which additionally requires a Shopify-granted
+> theme-files **exemption**. Until that's approved, metaobjects still deploy fine and
+> theme files return a clear access error in the modal.
+
+> Metaobject references validate against a definition **GID**, so create base
+> definitions first, then the ones that point at them.
