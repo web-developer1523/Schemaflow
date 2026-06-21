@@ -539,7 +539,6 @@ export default function SchemaFlow() {
 
   const connections = useMemo(() => {
     const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
-    // index every theme-section node by its handle so layout entries can auto-match
     const sectionByHandle = {};
     nodes.forEach((n) => { if (n.category === "section") sectionByHandle[dashOf(n.name)] = n; });
 
@@ -547,10 +546,8 @@ export default function SchemaFlow() {
     nodes.forEach((n) => {
       n.fields.forEach((f) => {
         if (f.type === "REFERENCE" && f.targetNodeId && byId[f.targetNodeId]) {
-          // metaobject ↔ metaobject data reference
           out.push({ id: f.id, from: n, to: byId[f.targetNodeId], label: f.name, kind: "ref" });
         } else if (f.type === "SECTION") {
-          // page layout → theme section: use an explicit link, else match by handle
           const target = (f.targetNodeId && byId[f.targetNodeId])
             ? byId[f.targetNodeId]
             : sectionByHandle[dashOf(f.name)];
@@ -747,9 +744,14 @@ export default function SchemaFlow() {
     }
   };
 
-  /* ---- LIVE deployment via our own Express backend (/api/deploy) ---- */
-  const API_VERSION = "2026-04"; // enforced server-side; shown here for reference
-  const DEPLOY_ENDPOINT = "/api/deploy";
+  /* ---- LIVE Shopify Admin GraphQL deployment ---- */
+  const API_VERSION = "2026-04";
+  const MUTATION = `mutation SchemaFlowCreate($definition: MetaobjectDefinitionCreateInput!) {
+  metaobjectDefinitionCreate(definition: $definition) {
+    metaobjectDefinition { id type name }
+    userErrors { field message code }
+  }
+}`;
 
   // Convert our internal schema into Shopify MetaobjectDefinitionCreateInput objects.
   const toShopifyDefinitions = useCallback(() => {
@@ -782,30 +784,57 @@ export default function SchemaFlow() {
     if (!host) { setDeployState((s) => ({ ...s, phase: "error", error: "Enter your store URL (your-store.myshopify.com)." })); return; }
     if (!token.trim()) { setDeployState((s) => ({ ...s, phase: "error", error: "Enter your Admin API access token (shpat_…)." })); return; }
 
-    const jsonSchema = toShopifyDefinitions();
-    setDeployState({ phase: "running", step: `Deploying ${jsonSchema.length} definition${jsonSchema.length === 1 ? "" : "s"} via backend…`, log: [], error: "" });
+    const endpoint = `https://${host}/admin/api/${API_VERSION}/graphql.json`;
+    const definitions = toShopifyDefinitions();
+    const log = [];
+    setDeployState({ phase: "running", step: `Connecting to ${host}…`, log: [], error: "" });
 
     try {
-      // Standard same-origin call to OUR server — no CORS, token relayed server-to-server.
-      const res = await fetch(DEPLOY_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ storeUrl: host, adminApiToken: token.trim(), jsonSchema }),
-      });
+      for (let i = 0; i < definitions.length; i++) {
+        const def = definitions[i];
+        setDeployState({ phase: "running", step: `[${i + 1}/${definitions.length}] Creating "${def.name}"…`, log: [...log], error: "" });
 
-      let data = {};
-      try { data = await res.json(); } catch { /* non-JSON error */ }
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": token.trim(),
+          },
+          body: JSON.stringify({ query: MUTATION, variables: { definition: def } }),
+        });
 
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || `Server responded ${res.status} ${res.statusText}`);
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(`HTTP ${res.status} ${res.statusText}${text ? ` — ${text.slice(0, 300)}` : ""}`);
+        }
+
+        const data = await res.json();
+        if (data.errors?.length) {
+          throw new Error(data.errors.map((e) => e.message).join(" · "));
+        }
+        const payload = data.data?.metaobjectDefinitionCreate;
+        const userErrors = payload?.userErrors || [];
+        if (userErrors.length) {
+          throw new Error(`${def.name}: ${userErrors.map((e) => `${e.message}${e.field ? ` (${e.field})` : ""}`).join(" · ")}`);
+        }
+        log.push(`✓ ${payload?.metaobjectDefinition?.name || def.name} → ${payload?.metaobjectDefinition?.id || "created"}`);
+        setDeployState({ phase: "running", step: `[${i + 1}/${definitions.length}] Created "${def.name}"`, log: [...log], error: "" });
       }
 
-      const log = (data.results || []).map((r) => `✓ ${r.name} → ${r.id}`);
-      setDeployState({ phase: "done", step: "", log, error: "" });
+      setDeployState({ phase: "done", step: "", log: [...log], error: "" });
       setModalOpen(false);
       fireToast(`Successfully deployed to ${host}! Your Metaobjects are now live in your Shopify Admin panel.`);
     } catch (err) {
-      setDeployState((s) => ({ ...s, phase: "error", error: err?.message || String(err) }));
+      // Surface the exact failure — for browser→Admin API this is usually the CORS block.
+      const raw = err?.message || String(err);
+      const isCors = /failed to fetch|networkerror|load failed/i.test(raw);
+      setDeployState((s) => ({
+        ...s,
+        phase: "error",
+        error: isCors
+          ? `${raw}\n\nShopify's Admin API blocks direct browser requests (CORS). The fetch fired correctly, but the browser refused the cross-origin response. Run this same request through a backend/proxy you control, where the token also stays safe.`
+          : raw,
+      }));
     }
   };
 
@@ -1341,8 +1370,8 @@ function DeployModal({ host, storeUrl, setStoreUrl, token, setToken, showToken, 
           <div className="mt-4 flex items-start gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5">
             <ShieldCheck size={15} className="mt-0.5 shrink-0 text-emerald-400" />
             <p className="text-[11.5px] leading-relaxed text-slate-300">
-              Your token is sent over HTTPS to your own SchemaFlow backend, relayed server-to-server to Shopify,
-              and never written to disk or logged. Nothing is stored after the request completes.
+              Your credentials are processed directly in the browser and are never saved on external servers.
+              The request goes straight from this tab to your store.
             </p>
           </div>
 
@@ -1374,7 +1403,7 @@ function DeployModal({ host, storeUrl, setStoreUrl, token, setToken, showToken, 
         {/* actions */}
         <div className="flex items-center gap-2 px-5 py-3.5" style={{ borderTop: "1px solid #16223a", background: "#0a1018" }}>
           <Lock size={12} className="text-slate-600" />
-          <span className="font-mono text-[10px] text-slate-600">via /api/deploy proxy</span>
+          <span className="font-mono text-[10px] text-slate-600">client-side only</span>
           <div className="ml-auto flex gap-2">
             <button onClick={onClose} disabled={running}
               className="rounded-lg border border-slate-700 px-3.5 py-2 text-[12px] font-semibold text-slate-300 transition-colors hover:bg-slate-800 disabled:opacity-40">
