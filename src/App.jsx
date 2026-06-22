@@ -899,7 +899,7 @@ export default function SchemaFlow() {
   };
 
   return (
-    <div className="flex h-[760px] w-full overflow-hidden font-sans text-slate-200"
+    <div className="flex h-[100vh] w-full overflow-hidden font-sans text-slate-200"
       style={{ background: "#070d18", fontFamily: "ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif" }}>
 
       {/* ============================= LEFT: BUILDER ============================= */}
