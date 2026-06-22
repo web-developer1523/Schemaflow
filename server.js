@@ -160,27 +160,44 @@ app.post("/api/deploy", async (req, res) => {
         const existing = new Set((existData?.theme?.files?.nodes || []).map((n) => n.filename));
         stubFiles = candidates
           .filter((fn) => !existing.has(fn))
-          .map((fn) => ({ filename: fn, value: stubSection(fn.slice("sections/".length, -".liquid".length)), _stub: true }));
+          .map((fn) => ({ filename: fn, value: stubSection(fn.slice("sections/".length, -".liquid".length)) }));
       }
 
-      const allFiles = [...files, ...stubFiles];
-      const data = await shopifyGraphQL(endpoint, token, THEME_FILES_MUTATION, {
-        themeId: main.id,
-        files: allFiles.map((f) => ({ filename: f.filename, body: { type: "TEXT", value: String(f.value ?? "") } })),
-      });
-      const payload = data?.themeFilesUpsert;
-      const userErrors = payload?.userErrors || [];
-      if (userErrors.length) {
-        return res.status(422).json({
-          ok: false,
-          error: `Theme files (${main.name}): ${userErrors.map((e) => `${e.message}${e.field ? ` (${e.field})` : ""}`).join(" · ")}`,
-          results,
-        });
-      }
       const stubSet = new Set(stubFiles.map((f) => f.filename));
-      for (const f of payload?.upsertedThemeFiles || []) {
-        results.push({ kind: "theme", name: stubSet.has(f.filename) ? `${f.filename} (auto-created)` : f.filename, id: `${main.name} (theme)` });
+
+      // Split into ordered passes. Shopify validates a template against sections
+      // that ALREADY exist on the theme, so sections (incl. stubs) must be written
+      // and committed BEFORE the templates that reference them.
+      const sectionPass = [...files.filter((f) => f.filename.startsWith("sections/")), ...stubFiles];
+      const otherPass = files.filter((f) => !f.filename.startsWith("sections/") && !f.filename.startsWith("templates/"));
+      const templatePass = files.filter((f) => f.filename.startsWith("templates/"));
+
+      const runUpsert = async (batch) => {
+        if (!batch.length) return;
+        const data = await shopifyGraphQL(endpoint, token, THEME_FILES_MUTATION, {
+          themeId: main.id,
+          files: batch.map((f) => ({ filename: f.filename, body: { type: "TEXT", value: String(f.value ?? "") } })),
+        });
+        const payload = data?.themeFilesUpsert;
+        const userErrors = payload?.userErrors || [];
+        if (userErrors.length) {
+          const err = new Error(`Theme files (${main.name}): ${userErrors.map((e) => `${e.message}${e.field ? ` (${e.field})` : ""}`).join(" · ")}`);
+          err.status = 422;
+          throw err;
+        }
+        for (const f of payload?.upsertedThemeFiles || []) {
+          results.push({ kind: "theme", name: stubSet.has(f.filename) ? `${f.filename} (auto-created)` : f.filename, id: `${main.name} (theme)` });
+        }
+      };
+
+      // Pass 1: sections (+ any other assets) so templates can resolve them.
+      await runUpsert([...sectionPass, ...otherPass]);
+      // Give Shopify a moment to commit the new section files before validating templates.
+      if (templatePass.length && (sectionPass.length || stubFiles.length)) {
+        await new Promise((r) => setTimeout(r, 1200));
       }
+      // Pass 2: templates.
+      await runUpsert(templatePass);
     }
 
     return res.json({ ok: true, store: host, apiVersion: API_VERSION, results });
