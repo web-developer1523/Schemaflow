@@ -912,7 +912,7 @@ export default function SchemaFlow() {
           </span>
           <div className="leading-tight">
             <div className="text-[15px] font-bold tracking-tight text-white">SchemaFlow</div>
-            <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-emerald-400/80">Metaobject Architect</div>
+            <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-emerald-400/80">SchemaFlow Architect</div>
           </div>
         </div>
 
