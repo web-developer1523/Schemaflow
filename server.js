@@ -27,6 +27,13 @@ const META_MUTATION = `mutation SchemaFlowCreate($definition: MetaobjectDefiniti
   }
 }`;
 
+const METAFIELD_MUTATION = `mutation SchemaFlowMetafield($definition: MetafieldDefinitionInput!) {
+  metafieldDefinitionCreate(definition: $definition) {
+    createdDefinition { id name namespace key }
+    userErrors { field message code }
+  }
+}`;
+
 const THEMES_QUERY = `query SchemaFlowThemes { themes(first: 50) { nodes { id name role } } }`;
 
 const THEME_FILES_MUTATION = `mutation SchemaFlowThemeFiles($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
@@ -85,19 +92,20 @@ app.get("/api/health", (_req, res) => res.json({ ok: true, apiVersion: API_VERSI
 
 app.post("/api/deploy", async (req, res) => {
   try {
-    const { storeUrl, adminApiToken, jsonSchema, themeFiles } = req.body || {};
+    const { storeUrl, adminApiToken, jsonSchema, metafields, themeFiles } = req.body || {};
 
     // Token may come from the request OR a server-side env var (keeps it out of the browser).
     const token = (adminApiToken && String(adminApiToken).trim()) || process.env.SHOPIFY_ADMIN_TOKEN;
     const host = normalizeStore(storeUrl);
 
     const defs = Array.isArray(jsonSchema) ? jsonSchema : [];
+    const mfs = Array.isArray(metafields) ? metafields : [];
     const files = Array.isArray(themeFiles) ? themeFiles : [];
 
     if (!host) return res.status(400).json({ ok: false, error: "Missing storeUrl (your-store.myshopify.com)." });
     if (!token) return res.status(400).json({ ok: false, error: "Missing Admin API access token." });
-    if (defs.length === 0 && files.length === 0)
-      return res.status(400).json({ ok: false, error: "Nothing to deploy — send at least one metaobject definition or theme file." });
+    if (defs.length === 0 && mfs.length === 0 && files.length === 0)
+      return res.status(400).json({ ok: false, error: "Nothing to deploy — send at least one metaobject, metafield, or theme file." });
 
     const endpoint = `https://${host}/admin/api/${API_VERSION}/graphql.json`;
     const results = [];
@@ -108,6 +116,15 @@ app.post("/api/deploy", async (req, res) => {
       const payload = data?.metaobjectDefinitionCreate;
       const userErrors = payload?.userErrors || [];
       if (userErrors.length) {
+        // Idempotent deploy: if the definition already exists (type/name taken),
+        // skip it instead of failing the whole run so re-deploys keep working.
+        const alreadyExists = userErrors.every(
+          (e) => e.code === "TAKEN" || /already been taken|already exists/i.test(e.message || "")
+        );
+        if (alreadyExists) {
+          results.push({ kind: "metaobject", name: definition.name, id: "already exists — skipped" });
+          continue;
+        }
         return res.status(422).json({
           ok: false,
           error: `${definition.name}: ${userErrors
@@ -120,6 +137,35 @@ app.post("/api/deploy", async (req, res) => {
         kind: "metaobject",
         name: payload?.metaobjectDefinition?.name || definition.name,
         id: payload?.metaobjectDefinition?.id || "created",
+      });
+    }
+
+    // ---- 1b) Metafield definitions (Admin GraphQL) ----
+    for (const definition of mfs) {
+      const data = await shopifyGraphQL(endpoint, token, METAFIELD_MUTATION, { definition });
+      const payload = data?.metafieldDefinitionCreate;
+      const userErrors = payload?.userErrors || [];
+      const label = `${definition.ownerType?.toLowerCase?.() || "metafield"} · ${definition.namespace}.${definition.key}`;
+      if (userErrors.length) {
+        const alreadyExists = userErrors.every(
+          (e) => e.code === "TAKEN" || /already been taken|already exists|in use/i.test(e.message || "")
+        );
+        if (alreadyExists) {
+          results.push({ kind: "metafield", name: label, id: "already exists — skipped" });
+          continue;
+        }
+        return res.status(422).json({
+          ok: false,
+          error: `${definition.name} (${label}): ${userErrors
+            .map((e) => `${e.message}${e.field ? ` (${Array.isArray(e.field) ? e.field.join(".") : e.field})` : ""}`)
+            .join(" · ")}`,
+          results,
+        });
+      }
+      results.push({
+        kind: "metafield",
+        name: payload?.createdDefinition?.name || definition.name,
+        id: payload?.createdDefinition?.id || "created",
       });
     }
 
